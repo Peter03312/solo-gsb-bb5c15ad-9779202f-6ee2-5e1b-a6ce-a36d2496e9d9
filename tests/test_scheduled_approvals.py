@@ -779,6 +779,149 @@ class TestStartupCatchup:
         assert client.get(f"/api/applications/{b}").json()["status"] == "pending"
 
 
+class TestDueButNotSweptProtection:
+    """A due-but-not-yet-swept appointment belongs to the sweep.
+
+    When the background scan is delayed or disabled the booked instant may
+    have arrived while the row is still ``scheduled``.  Rebooking, explicit
+    rescheduling and cancelling must then be refused (409
+    ``scheduled_approval_due``) so the due adjudication cannot be skipped; the
+    rejection leaves the application, appointment, waitlist place, revision
+    and lifecycle events untouched, and a later sweep still decides the
+    original appointment.
+    """
+
+    def _due_appointment(self, client, app_id):
+        booking_id = book_due(client, app_id)
+        # No sweep ran: the instant has arrived but the row is still waiting.
+        booking = get_booking(client, booking_id)
+        assert booking["status"] == "scheduled"
+        return booking_id
+
+    def _assert_unchanged(self, client, app_id, booking_id):
+        # The original appointment survives, still waiting at its instant; the
+        # application stays pending and no revision was consumed.
+        booking = get_booking(client, booking_id)
+        assert booking["status"] == "scheduled"
+        assert client.get(f"/api/applications/{app_id}").json()["status"] == (
+            "pending"
+        )
+        assert (
+            client.get("/api/revision/current").json()["current_revision"] == 0
+        )
+        # No lifecycle event was appended by the rejected call: the live
+        # appointment keeps only its booking audit row and still no outcome.
+        history = client.get(
+            f"/api/applications/{app_id}/scheduled-approvals"
+        ).json()["scheduled_approvals"]
+        assert [b["id"] for b in history] == [booking_id]
+        assert history[0]["status"] == "scheduled"
+        assert "processed_at" not in history[0]
+        assert history[0].get("outcome_reason") is None
+
+    def test_rebooking_due_appointment_rejected_and_kept_for_sweep(self, client):
+        a = submit(client, 100, 110, "A")
+        booking_id = self._due_appointment(client, a)
+        r = client.post(
+            f"/api/applications/{a}/scheduled-approvals",
+            json={"scheduled_at": iso(NOW + timedelta(hours=2)), "reason": "x"},
+        )
+        assert r.status_code == 409, r.text
+        err = r.json()["error"]
+        assert err["code"] == "scheduled_approval_due"
+        assert err["details"]["scheduled_approval_id"] == booking_id
+        self._assert_unchanged(client, a, booking_id)
+        # The sweep still decides the original appointment.
+        summary = process_due(client)
+        assert summary["approved_application_ids"] == [a]
+        assert get_booking(client, booking_id)["status"] == "approved"
+
+    def test_reschedule_due_appointment_rejected_even_with_invalid_new_instant(
+        self, client
+    ):
+        # The due guard fires before the new-instant validation, so the
+        # original appointment is kept regardless of the proposed instant.
+        a = submit(client, 100, 110, "A")
+        booking_id = self._due_appointment(client, a)
+        r = client.post(
+            f"/api/applications/{a}/scheduled-approvals/reschedule",
+            json={"scheduled_at": iso(WINDOW_END + timedelta(hours=1))},
+        )
+        assert r.status_code == 409, r.text
+        assert r.json()["error"]["code"] == "scheduled_approval_due"
+        self._assert_unchanged(client, a, booking_id)
+
+    def test_cancel_due_appointment_rejected_and_kept_for_sweep(self, client):
+        a = submit(client, 100, 110, "A")
+        booking_id = self._due_appointment(client, a)
+        r = client.post(
+            f"/api/applications/{a}/scheduled-approvals/cancel",
+            json={"reason": "too late"},
+        )
+        assert r.status_code == 409, r.text
+        assert r.json()["error"]["code"] == "scheduled_approval_due"
+        self._assert_unchanged(client, a, booking_id)
+        summary = process_due(client)
+        assert summary["approved_application_ids"] == [a]
+
+    def test_due_guard_runs_inside_revision_arbitration_and_blocks_blocking_sweep(
+        self, client
+    ):
+        # The protected appointment must still reach the due sweep, which then
+        # adjudicates against the live effective set: with an incumbent in
+        # place the appointment is blocked, never silently withdrawn.
+        lic = submit(client, 100, 110, "lic")
+        approve(client, lic, 0)
+        b = submit(client, 105, 108, "B")
+        booking_id = self._due_appointment(client, b)
+        r = client.post(f"/api/applications/{b}/scheduled-approvals/cancel")
+        assert r.status_code == 409
+        summary = process_due(client)
+        assert summary["blocked_application_ids"] == [b]
+        booking = get_booking(client, booking_id)
+        assert booking["status"] == "blocked"
+        assert client.get(f"/api/applications/{b}").json()["status"] == "pending"
+
+    def test_due_guard_keeps_waitlist_place(self, client):
+        c = submit(client, 300, 310, "C")
+        client.post(f"/api/applications/{c}/waitlist")
+        booking_id = self._due_appointment(client, c)
+        r = client.post(f"/api/applications/{c}/scheduled-approvals/cancel")
+        assert r.status_code == 409
+        # The rejected cancel neither moves the queue nor books the outcome.
+        ids = client.get("/api/waitlist").json()["waitlist_application_ids"]
+        assert ids == [c]
+        assert get_booking(client, booking_id)["waitlist_position"] == 1
+        process_due(client)
+        # The sweep passes it and removes it from the waitlist as always.
+        assert client.get("/api/waitlist").json()["waitlist_application_ids"] == []
+
+    def test_history_unchanged_by_due_rejection(self, client):
+        a = submit(client, 100, 110, "A")
+        booking_id = self._due_appointment(client, a)
+        client.post(f"/api/applications/{a}/scheduled-approvals/cancel")
+        # The current-revision audit replay still shows the single booked
+        # appointment waiting to fire with no result fields leaked.
+        current = client.get("/api/revision/current").json()
+        assert current["scheduled_approval_ids"] == [booking_id]
+        row = current["scheduled_approvals"][0]
+        assert row["status"] == "scheduled"
+        assert row.get("processed_at") is None
+        assert row.get("outcome_reason") is None
+
+    def test_not_yet_due_appointment_still_reschedulable_and_cancellable(
+        self, client
+    ):
+        a = submit(client, 100, 110, "A")
+        booking_id = book(client, a, NOW + timedelta(hours=1)).json()[
+            "scheduled_approval_id"
+        ]
+        body = reschedule(client, a, NOW + timedelta(hours=2))
+        assert body["scheduled_approval_id"] == booking_id
+        cancel(client, a)
+        assert get_booking(client, booking_id)["status"] == "cancelled"
+
+
 class TestCompetition:
     def test_cancel_racing_due_processing_only_one_outcome_wins(self, client):
         # After the appointment fires, a late cancel fails (it is no longer
