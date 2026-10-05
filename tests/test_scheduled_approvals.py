@@ -874,3 +874,176 @@ class TestQueries:
         cancel(client, a)
         body = client.get("/api/revision/current").json()
         assert body["scheduled_approval_ids"] == []
+
+
+class TestDueAppointmentModificationGuard:
+    """A waiting appointment whose booked instant has arrived belongs to the
+    due sweep: while the poller is delayed or disabled, rebooking,
+    rescheduling and cancelling are refused (409 ``scheduled_approval_due``)
+    inside the shared revision arbitration and change nothing, so the due
+    adjudication is never skipped."""
+
+    def test_rebook_due_appointment_refused_and_preserved(self, client):
+        a = submit(client, 100, 110, "A")
+        booking_id = book_at(client, a, 150)
+        original = get_booking(client, booking_id)
+        time.sleep(0.3)  # the booked instant has arrived; no sweep ran
+        r = book(client, a, NOW + timedelta(hours=2), expect_status=409)
+        err = r.json()["error"]
+        assert err["code"] == "scheduled_approval_due"
+        details = err["details"]
+        assert details["scheduled_approval_id"] == booking_id
+        assert details["application_id"] == a
+        assert details["status"] == "scheduled"
+        assert details["scheduled_at"] == original["scheduled_at"]
+        # Nothing changed: same row, same instant, still waiting, no new
+        # appointment, no revision consumed.
+        after = get_booking(client, booking_id)
+        assert after["status"] == "scheduled"
+        assert after["scheduled_at"] == original["scheduled_at"]
+        assert "processed_at" not in after
+        listing = client.get(
+            f"/api/applications/{a}/scheduled-approvals"
+        ).json()
+        assert listing["count"] == 1
+        assert (
+            client.get("/api/revision/current").json()["current_revision"] == 0
+        )
+        # The refusal appended no lifecycle event: the booking-revision
+        # snapshot still shows the original instant, waiting to fire.
+        snapshot = client.get("/api/revision/0").json()
+        record = snapshot["scheduled_approvals"][0]
+        assert record["status"] == "scheduled"
+        assert record["scheduled_at"] == original["scheduled_at"]
+        # The preserved appointment is still adjudicated by the sweep.
+        summary = process_due(client)
+        assert summary["approved_application_ids"] == [a]
+        fired = get_booking(client, booking_id)
+        assert fired["status"] == "approved"
+        assert fired["approval_revision"] == 1
+        # Terminal now: rebooking follows the ordinary rules (the application
+        # is no longer pending) and reschedule/cancel keep the old refusal.
+        r = book(client, a, NOW + timedelta(hours=2), expect_status=409)
+        assert r.json()["error"]["code"] == "not_pending"
+        r = client.post(
+            f"/api/applications/{a}/scheduled-approvals/reschedule",
+            json={"scheduled_at": iso(NOW + timedelta(hours=2))},
+        )
+        assert r.status_code == 409
+        assert r.json()["error"]["code"] == "scheduled_approval_not_active"
+
+    def test_reschedule_due_appointment_refused_and_preserved(self, client):
+        a = submit(client, 100, 110, "A")
+        booking_id = book_at(client, a, 150)
+        original = get_booking(client, booking_id)
+        time.sleep(0.3)
+        r = client.post(
+            f"/api/applications/{a}/scheduled-approvals/reschedule",
+            json={"scheduled_at": iso(NOW + timedelta(hours=2))},
+        )
+        assert r.status_code == 409
+        assert r.json()["error"]["code"] == "scheduled_approval_due"
+        after = get_booking(client, booking_id)
+        assert after["status"] == "scheduled"
+        assert after["scheduled_at"] == original["scheduled_at"]
+        assert after["reason"] == original["reason"]
+        assert (
+            client.get("/api/revision/current").json()["current_revision"] == 0
+        )
+        summary = process_due(client)
+        assert summary["approved_application_ids"] == [a]
+        assert get_booking(client, booking_id)["status"] == "approved"
+
+    def test_cancel_due_appointment_refused_and_preserved(self, client):
+        a = submit(client, 100, 110, "A")
+        booking_id = book_at(client, a, 150)
+        time.sleep(0.3)
+        r = client.post(f"/api/applications/{a}/scheduled-approvals/cancel")
+        assert r.status_code == 409
+        assert r.json()["error"]["code"] == "scheduled_approval_due"
+        after = get_booking(client, booking_id)
+        assert after["status"] == "scheduled"
+        assert (
+            client.get("/api/revision/current").json()["current_revision"] == 0
+        )
+        summary = process_due(client)
+        assert summary["approved_application_ids"] == [a]
+        assert get_booking(client, booking_id)["status"] == "approved"
+
+    def test_refusal_keeps_waitlist_place(self, client):
+        c = submit(client, 300, 310, "C")
+        client.post(f"/api/applications/{c}/waitlist")
+        book_at(client, c, 150)
+        time.sleep(0.3)
+        r = client.post(f"/api/applications/{c}/scheduled-approvals/cancel")
+        assert r.status_code == 409
+        assert r.json()["error"]["code"] == "scheduled_approval_due"
+        queue = client.get("/api/waitlist").json()
+        assert queue["waitlist_application_ids"] == [c]
+        entry = client.get(f"/api/applications/{c}/waitlist").json()
+        assert entry["position"] == 1
+        # The sweep still fires the preserved appointment and dequeues it.
+        process_due(client)
+        assert client.get(f"/api/applications/{c}").json()["status"] == (
+            "approved"
+        )
+        assert (
+            client.get("/api/waitlist").json()["waitlist_application_ids"] == []
+        )
+
+    def test_due_appointment_blocked_by_sweep_then_terminal_rules(self, client):
+        lic = submit(client, 100, 110, "lic")
+        approve(client, lic, 0)
+        b = submit(client, 105, 108, "B")
+        booking_id = book_at(client, b, 150)
+        time.sleep(0.3)
+        # Due but unprocessed: modification is refused, the appointment is
+        # preserved for the sweep.
+        r = client.post(f"/api/applications/{b}/scheduled-approvals/cancel")
+        assert r.status_code == 409
+        assert r.json()["error"]["code"] == "scheduled_approval_due"
+        # The sweep adjudicates at processing time: blocked by the incumbent.
+        summary = process_due(client)
+        assert summary["blocked_application_ids"] == [b]
+        assert get_booking(client, booking_id)["status"] == "blocked"
+        # Terminal now: reschedule/cancel keep the existing refusal, and a
+        # fresh booking follows the ordinary rules on the still-pending
+        # application.
+        r = client.post(f"/api/applications/{b}/scheduled-approvals/cancel")
+        assert r.status_code == 409
+        assert r.json()["error"]["code"] == "scheduled_approval_not_active"
+        r = client.post(
+            f"/api/applications/{b}/scheduled-approvals/reschedule",
+            json={"scheduled_at": iso(NOW + timedelta(hours=2))},
+        )
+        assert r.status_code == 409
+        assert r.json()["error"]["code"] == "scheduled_approval_not_active"
+        again = book(client, b, NOW + timedelta(hours=2)).json()
+        assert again["status"] == "scheduled"
+        assert again["scheduled_approval_id"] != booking_id
+
+    def test_history_matches_live_after_due_guard_and_sweep(self, client):
+        a = submit(client, 100, 110, "A")
+        booking_id = book_at(client, a, 150)
+        original = get_booking(client, booking_id)
+        time.sleep(0.3)
+        r = client.post(
+            f"/api/applications/{a}/scheduled-approvals/reschedule",
+            json={"scheduled_at": iso(NOW + timedelta(hours=2))},
+        )
+        assert r.status_code == 409
+        process_due(client)
+        live = get_booking(client, booking_id)
+        assert live["status"] == "approved"
+        # Revision 0 (the booking revision): still waiting, original instant,
+        # no outcome leaked.
+        snap0 = client.get("/api/revision/0").json()["scheduled_approvals"][0]
+        assert snap0["status"] == "scheduled"
+        assert snap0["scheduled_at"] == original["scheduled_at"]
+        assert snap0["processed_at"] is None
+        # Revision 1 (the approval revision): decided, identical to the live
+        # appointment query.
+        snap1 = client.get("/api/revision/1").json()["scheduled_approvals"][0]
+        assert snap1["status"] == "approved"
+        assert snap1["approval_revision"] == 1
+        assert snap1["processed_at"] == live["processed_at"]

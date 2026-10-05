@@ -600,6 +600,21 @@ UTC 左闭右开时段）加原因做**只读预演**，再携预演返回的当
   `reason`）：到期前取消，预约进入 `cancelled` 终态、**不占修订号**；取消后可
   重新预约。无待执行预约 → 409 `scheduled_approval_not_active`。
 
+**到期未扫描时拒绝修改（到期守卫，与到期扫描同一修订号仲裁）**
+
+重复预约（再次调用预约接口即改期）、显式改期、取消这三条修改路径，都在与到期
+扫描**共用的单行修订号锁**内按**服务端 UTC 时间**核对原约定时刻：**仅当原预约
+仍为 `scheduled` 且原约定时刻尚未到达**（严格晚于当前时刻）才允许修改。原时刻
+**已到但尚未扫描**（后台轮询延迟或被 `SCHEDULED_APPROVAL_BACKGROUND=0` 关闭、
+启动补处理未运行）时，三条路径一律返回 **409 `scheduled_approval_due`**
+（`details` 附 `scheduled_approval_id` / `application_id` / `status` /
+`scheduled_at` / `now`），**原预约原样保留**等待扫描裁决——到期裁决不会被跳过。
+该拒绝**不改变**申请、预约、候补队位、修订号或预约生命周期事件；随后的扫描仍按
+处理当时的保护带宽、有效许可与生效管制窗口裁决这条保留的预约。原预约进入终态
+（`approved`/`blocked`/`cancelled`/`invalidated`）后：显式改期与取消沿用既有
+409 `scheduled_approval_not_active`；重复预约仍按原规则办理（申请仍待审则新建
+预约，已获批等非待审则 409 `not_pending`）。
+
 **到期处理（共用修订仲裁；启动补处理与后台轮询）**
 
 到期不做预判，而是在**实际处理时刻**进入与手动批准/暂停/撤销/交接/紧急占用相同的
@@ -633,7 +648,9 @@ UTC 左闭右开时段）加原因做**只读预演**，再携预演返回的当
 修订号起**的历史快照返回**一致**的 `processed_at` 与 `outcome_reason`，更早的修订
 仍呈现待执行、不提前泄漏结果。**失效不算预约自动审批**：`approval_revision` 与
 `processed_guard_band` 仍为空，不再次到期执行，也不额外占用修订号。取消、改期、
-到期处理与这些审批都在同一修订号锁上串行，因此**只允许一种结果生效**。
+到期处理与这些审批都在同一修订号锁上串行，因此**只允许一种结果生效**；已到期的
+待执行预约在该锁内被识别为**已到期**，重复预约/改期/取消一律拒绝（见上「到期
+守卫」），扫描必定裁决原预约。
 
 **查询与历史**
 
@@ -809,9 +826,9 @@ UTC 左闭右开时段）加原因做**只读预演**，再携预演返回的当
 | `POST` | `/api/emergency-occupations/{id}/release` | **解除紧急占用**（紧急申请 ID + 预期修订号；撤销紧急许可→按暂停顺序重裁恢复→FIFO 重裁候补，整笔原子） |
 | `GET` | `/api/emergency-occupations` | 列出生效紧急占用（`include_inactive`/`status` 可含已解除） |
 | `GET` | `/api/emergency-occupations/{id}` | 查询单个紧急占用（生效中或已解除） |
-| `POST` | `/api/applications/{id}/scheduled-approvals` | **预约 UTC 自动审批**（时刻须晚于当前、早于申请时段结束；不占修订号；重复调用即改期） |
-| `POST` | `/api/applications/{id}/scheduled-approvals/reschedule` | **改期**预约（到期前；新时刻同样校验） |
-| `POST` | `/api/applications/{id}/scheduled-approvals/cancel` | **取消**预约（到期前；不占修订号） |
+| `POST` | `/api/applications/{id}/scheduled-approvals` | **预约 UTC 自动审批**（时刻须晚于当前、早于申请时段结束；不占修订号；重复调用即改期；原时刻已到未扫描 → 409 `scheduled_approval_due`） |
+| `POST` | `/api/applications/{id}/scheduled-approvals/reschedule` | **改期**预约（仅原约定时刻未到前；新时刻同样校验；已到未扫描 → 409 `scheduled_approval_due`） |
+| `POST` | `/api/applications/{id}/scheduled-approvals/cancel` | **取消**预约（仅原约定时刻未到前；不占修订号；已到未扫描 → 409 `scheduled_approval_due`） |
 | `GET` | `/api/applications/{id}/scheduled-approvals` | 查询单个申请的全部预约（含历史终态） |
 | `GET` | `/api/scheduled-approvals` | 列出/过滤预约（`status`、`application_id`） |
 | `GET` | `/api/scheduled-approvals/{id}` | 查询单个预约：状态、实际处理时间（到期处理或失效决定时刻）、审批修订号或阻塞明细 |
@@ -858,6 +875,7 @@ UTC 左闭右开时段）加原因做**只读预演**，再携预演返回的当
 | 422 | `scheduled_time_invalid` | 预约时刻**不是严格晚于当前 UTC 时刻**（`scheduled_at_not_in_future`）、**不早于申请时段结束**（`scheduled_at_not_before_window_end`）或为**无时区时刻**（`naive_datetime`）；整笔拒收且**不留预约** |
 | 404 | `scheduled_approval_not_found` | 查询一个从未存在的预约 ID |
 | 409 | `scheduled_approval_not_active` | 对一个**不在等待中**的预约改期/取消（已批准/已阻塞/已取消/已失效；`details.status` 给出当前状态） |
+| 409 | `scheduled_approval_due` | 原约定时刻**已到但尚未扫描**时对预约重复预约/改期/取消（到期守卫：原预约保留待扫描裁决，到期裁决不被跳过；`details` 附 `scheduled_approval_id`/`application_id`/`status`/`scheduled_at`/`now`；不改申请、预约、候补队位、修订号与生命周期事件） |
 | 404 | `not_found` | 为不存在的申请预约/改期/取消/查询自动审批（同申请类接口） |
 
 ---
@@ -2023,6 +2041,89 @@ curl -s -X POST http://localhost:8000/api/applications/{近处许可}/revoke \
 解除走同一套包络收窄 + 精确裁决；服务在大量时段不相交许可下启动与预演/写入
 均保持可用。
 
+### 6.22 预约到期守卫：到期未扫描时拒绝重复预约/改期/取消（本轮）
+
+后台轮询延迟或被关闭（`SCHEDULED_APPROVAL_BACKGROUND=0`）时，约定时刻**已到但
+尚未扫描**的待执行预约不再能被修改：重复预约、显式改期、取消都在与到期扫描
+**共用的修订号仲裁**内按**服务端 UTC 时间**核对原约定时刻，并拒绝为
+409 `scheduled_approval_due`——原预约原样保留，扫描必定裁决它，到期裁决不会被
+跳过。下例可直接运行 `./examples/scheduled-approval-due-guard.sh`（请先以
+`SCHEDULED_APPROVAL_BACKGROUND=0` 启动服务，使到期预约保持待执行）：
+
+```bash
+# 1) 提交待审申请 G（申请时段为未来 2~3 天）
+curl -s -X POST http://localhost:8000/api/applications \
+  -H 'Content-Type: application/json' \
+  -d "{\"name\":\"G\",\"circle\":{\"cx\":0,\"cy\":0,\"radius\":10},
+       \"frequency\":{\"low\":500,\"high\":510},
+       \"time_window\":{\"start\":\"$(date -u -d '+2 days' +%FT%TZ)\",
+                        \"end\":\"$(date -u -d '+3 days' +%FT%TZ)\"}}"
+# -> {"id": 1, "status": "pending", ...}
+
+# 2) 预约 2 秒后自动审批（预约不占修订号，当前修订号 0）
+curl -s -X POST http://localhost:8000/api/applications/1/scheduled-approvals \
+  -H 'Content-Type: application/json' \
+  -d "{\"scheduled_at\":\"$(date -u -d '+2 seconds' +%FT%TZ)\",\"reason\":\"到场确认\"}"
+# HTTP 201 -> {"booked":true,"action":"booked","scheduled_approval_id":1,
+#              "scheduled_at":"<T0+2s>","status":"scheduled","current_revision":0,...}
+
+sleep 3   # 约定时刻已到；扫描关闭/延迟，预约仍待执行
+
+# 3) 三条修改路径一律 409 scheduled_approval_due，原预约原样保留
+curl -i -X POST http://localhost:8000/api/applications/1/scheduled-approvals \
+  -H 'Content-Type: application/json' \
+  -d "{\"scheduled_at\":\"$(date -u -d '+1 hour' +%FT%TZ)\"}"
+# HTTP/1.1 409 {"error":{"code":"scheduled_approval_due",
+#   "details":{"scheduled_approval_id":1,"application_id":1,"status":"scheduled",
+#              "scheduled_at":"<原约定时刻>","now":"<服务端当前UTC>"}}}
+
+curl -i -X POST http://localhost:8000/api/applications/1/scheduled-approvals/reschedule \
+  -H 'Content-Type: application/json' \
+  -d "{\"scheduled_at\":\"$(date -u -d '+1 hour' +%FT%TZ)\"}"
+# HTTP/1.1 409 {"error":{"code":"scheduled_approval_due", ...同上...}}
+
+curl -i -X POST http://localhost:8000/api/applications/1/scheduled-approvals/cancel
+# HTTP/1.1 409 {"error":{"code":"scheduled_approval_due", ...同上...}}
+
+# 4) 拒绝未改任何状态：预约仍是原时刻的待执行，修订号仍是 0
+curl -s http://localhost:8000/api/scheduled-approvals/1
+# {"id":1,"status":"scheduled","scheduled_at":"<原约定时刻>",...}（无 processed_at）
+curl -s http://localhost:8000/api/revision/current
+# {"current_revision":0,"scheduled_approval_ids":[1],...}
+
+# 5) 扫描（手动触发，与后台轮询/启动补处理同一逻辑）仍裁决这条保留的预约
+curl -s -X POST http://localhost:8000/api/scheduled-approvals/process-due
+# {"processed_count":1,"approved_application_ids":[1],
+#  "from_revision":0,"final_revision":1,
+#  "results":[{"outcome":"approved","application_id":1,"revision":1,...}]}
+
+# 6) 决定结果在实时查询与历史修订查询中一致
+curl -s http://localhost:8000/api/scheduled-approvals/1
+# {"id":1,"status":"approved","approval_revision":1,"processed_at":"...",...}
+curl -s http://localhost:8000/api/revision/1
+# {"revision":1,"approvals":[{"revision":1,"application_id":1,"scheduled":true,...}],
+#  "scheduled_approvals":[{"id":1,"status":"approved","approval_revision":1,
+#                          "processed_at":"<与实时查询一致>",...}], ...}
+curl -s http://localhost:8000/api/revision/0
+# 修订号 0 仍呈现待执行（三次拒绝均未追加生命周期事件）：
+# {"revision":0,"scheduled_approvals":[{"id":1,"status":"scheduled",
+#   "scheduled_at":"<原约定时刻>","processed_at":null,...}], ...}
+
+# 7) 进入终态后：显式改期/取消沿用既有 409 scheduled_approval_not_active；
+#    重复预约按原规则办理（申请已获批 -> 409 not_pending）
+curl -i -X POST http://localhost:8000/api/applications/1/scheduled-approvals/cancel
+# HTTP/1.1 409 {"error":{"code":"scheduled_approval_not_active",
+#   "details":{"status":"approved"}}}
+curl -i -X POST http://localhost:8000/api/applications/1/scheduled-approvals \
+  -H 'Content-Type: application/json' \
+  -d "{\"scheduled_at\":\"$(date -u -d '+1 hour' +%FT%TZ)\"}"
+# HTTP/1.1 409 {"error":{"code":"not_pending","details":{"status":"approved"}}}
+```
+
+约定时刻**未到**的待执行预约不受本轮影响：重复预约仍改期（HTTP 200）、显式改期
+与取消仍成功（均不占修订号）；预约进入终态后，申请仍待审（如到期被阻塞）时重复
+预约仍新建预约（HTTP 201）。
+
 ---
 
 ## 7. 项目结构
@@ -2042,6 +2143,7 @@ curl -s -X POST http://localhost:8000/api/applications/{近处许可}/revoke \
 ├── examples/walkthrough.sh     # curl 走查脚本
 ├── examples/candidate-narrowing.sh # 大量时段不相交许可下的候选集收窄走查（本轮）
 ├── examples/emergency-history-lookback.sh # 紧急占用确认/解除与按修订回查不泄露解除决定（本轮）
+├── examples/scheduled-approval-due-guard.sh # 预约到期未扫描时拒绝重复预约/改期/取消（本轮）
 ├── Dockerfile
 ├── docker-compose.yml          # db + api 一键启动
 ├── requirements.txt / requirements-dev.txt

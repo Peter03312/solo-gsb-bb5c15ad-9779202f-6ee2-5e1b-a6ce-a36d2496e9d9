@@ -192,11 +192,21 @@ application at an instant strictly after the booking moment and strictly
 before the application's own time window ends.  Booking consumes no
 revision; an unknown/non-pending application or an invalid instant is
 rejected without leaving an appointment.  At most one waiting appointment
-exists per application and it may be cancelled or rescheduled before it
-fires.  A background sweeper (with a startup catch-up pass) processes due
-appointments inside the shared revision arbitration: at the actual
-processing instant the application is re-adjudicated against the live
-guard band, every effective license and every active restriction window.
+exists per application and it may be cancelled or rescheduled only before
+its booked instant arrives.  Once the booked instant is reached the
+appointment belongs to due processing -- even while the sweeper is delayed
+or disabled: rebooking, rescheduling and cancellation are then refused
+inside the same revision arbitration as the sweep (409
+``scheduled_approval_due``) and change nothing (the application, the
+appointment, its waitlist place, the revision and the appointment's
+lifecycle events all stay as they were), so the due adjudication is never
+skipped.  A terminal appointment keeps the existing refusals
+(reschedule/cancel -> 409 ``scheduled_approval_not_active``) while booking
+again follows the ordinary rules.  A background sweeper (with a startup
+catch-up pass) processes due appointments inside the shared revision
+arbitration: at the actual processing instant the application is
+re-adjudicated against the live guard band, every effective license and
+every active restriction window.
 A pass approves it on one new revision as an ordinary ``ApprovalEvent``
 flagged ``scheduled`` (a queued application leaves the waitlist first;
 the waitlist is not re-adjudicated afterwards); a clash or window hit is
@@ -345,6 +355,11 @@ E_SCHEDULE_NOT_FOUND = "scheduled_approval_not_found"
 E_SCHEDULE_NOT_ACTIVE = "scheduled_approval_not_active"
 E_SCHEDULE_TIME_INVALID = "scheduled_time_invalid"
 E_SCHEDULE_EXISTS = "scheduled_approval_exists"
+# A waiting appointment whose booked UTC instant has already arrived belongs
+# to the due sweep: rebooking/rescheduling/cancelling it is refused (HTTP
+# 409) so the due adjudication is never skipped, even while the background
+# poller is delayed or disabled.
+E_SCHEDULE_DUE = "scheduled_approval_due"
 
 
 # --------------------------------------------------------------------------- #
@@ -1418,6 +1433,37 @@ def get_active_schedule(session, application_id: int) -> ScheduledApproval | Non
         )
         .one_or_none()
     )
+
+
+def _ensure_schedule_not_due(
+    booking: ScheduledApproval, now: datetime
+) -> None:
+    """Refuse to modify a waiting appointment whose instant has arrived.
+
+    Called inside the shared revision arbitration (the same singleton lock
+    the due sweeper takes), so the check against the server UTC clock cannot
+    interleave with due processing.  Once the booked UTC instant is reached
+    the appointment belongs to the sweep: it must be adjudicated, not
+    modified.  The refusal changes nothing -- the application, the
+    appointment, its waitlist place, the revision and the appointment's
+    lifecycle events all stay as they were, and the next sweep still decides
+    the preserved appointment.
+    """
+    if _utc(booking.scheduled_at) <= now:
+        raise APIError(
+            E_SCHEDULE_DUE,
+            f"scheduled auto-approval {booking.id} is already due (booked "
+            f"instant {iso(booking.scheduled_at)} has been reached); it "
+            "awaits due processing and can no longer be modified",
+            status_code=409,
+            details={
+                "scheduled_approval_id": booking.id,
+                "application_id": booking.application_id,
+                "status": booking.status,
+                "scheduled_at": iso(booking.scheduled_at),
+                "now": iso(now),
+            },
+        )
 
 
 def process_due_scheduled_approvals(
@@ -4419,6 +4465,11 @@ def _book_or_reschedule_schedule(
             action = "booked"
             http_status = 201
         else:
+            # The booked instant has already arrived: the appointment
+            # belongs to the due sweep, so rebooking must not move it (the
+            # due adjudication would be skipped).  Refuse and leave it
+            # untouched for the next sweep.
+            _ensure_schedule_not_due(existing, now)
             existing.scheduled_at = scheduled_at
             existing.reason = payload.reason
             existing.updated_at = now
@@ -4470,8 +4521,11 @@ def book_scheduled_approval(
     change the application (a queued application keeps its queue place).  One
     application has at most one waiting appointment; calling this endpoint
     again before it fires *reschedules* the same appointment (200, action
-    ``rescheduled``) instead of creating a second one.  Unknown application
-    -> 404; non-pending -> 409 ``not_pending``; invalid instant -> 422
+    ``rescheduled``) instead of creating a second one.  A waiting appointment
+    whose booked instant has already arrived belongs to the due sweep:
+    rebooking it is refused (409 ``scheduled_approval_due``) and the
+    appointment is preserved for due processing.  Unknown application ->
+    404; non-pending -> 409 ``not_pending``; invalid instant -> 422
     ``scheduled_time_invalid``.
     """
     body, http_status = _book_or_reschedule_schedule(application_id, payload)
@@ -4491,6 +4545,10 @@ def reschedule_scheduled_approval(
     application -> 404; no waiting appointment -> 409
     ``scheduled_approval_not_active``; invalid instant -> 422
     ``scheduled_time_invalid`` (the existing appointment is kept unchanged).
+    A waiting appointment whose booked instant has already arrived belongs
+    to the due sweep: rescheduling it is refused (409
+    ``scheduled_approval_due``) and the appointment is preserved for due
+    processing.
     """
     with SessionLocal() as session, session.begin():
         session.get(RevisionMeta, 1, with_for_update=True)
@@ -4519,6 +4577,10 @@ def reschedule_scheduled_approval(
                 ),
             )
         now = datetime.now(timezone.utc)
+        # A waiting appointment whose booked instant has already arrived
+        # belongs to the due sweep: refuse to move it and leave it for
+        # processing (the due adjudication must not be skipped).
+        _ensure_schedule_not_due(existing, now)
         _validate_schedule_time(payload, row.end_time, now)
         existing.scheduled_at = payload.scheduled_at.astimezone(timezone.utc)
         existing.reason = payload.reason
@@ -4565,6 +4627,10 @@ def cancel_scheduled_approval(
     Unknown application -> 404; no waiting appointment -> 409
     ``scheduled_approval_not_active``.  A cancelled appointment stays in
     history with status ``cancelled`` and a new one can be booked afterwards.
+    A waiting appointment whose booked instant has already arrived belongs
+    to the due sweep: cancelling it is refused (409
+    ``scheduled_approval_due``) and the appointment is preserved for due
+    processing.
     """
     reason = payload.reason if payload is not None else ""
     with SessionLocal() as session, session.begin():
@@ -4593,9 +4659,13 @@ def cancel_scheduled_approval(
                     {"status": latest.status} if latest is not None else None
                 ),
             )
+        now = datetime.now(timezone.utc)
+        # A waiting appointment whose booked instant has already arrived
+        # belongs to the due sweep: refuse to cancel it and leave it for
+        # processing (the due adjudication must not be skipped).
+        _ensure_schedule_not_due(existing, now)
         existing.status = SCHEDULED_CANCELLED
         existing.outcome_reason = reason
-        now = datetime.now(timezone.utc)
         existing.updated_at = now
         session.flush()
         current = session.get(RevisionMeta, 1).revision

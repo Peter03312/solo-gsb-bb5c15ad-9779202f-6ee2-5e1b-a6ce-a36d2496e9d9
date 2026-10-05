@@ -598,7 +598,12 @@ class ScheduledApproval(Base):
     instant strictly after the booking time and strictly before the
     application's own time window ends.  Booking consumes no revision; at most
     one ``scheduled`` row exists per application (partial unique index), and
-    it may be cancelled or rescheduled before it fires.
+    it may be cancelled or rescheduled only before its booked instant
+    arrives.  Once the instant is reached the row belongs to due processing:
+    rebooking/rescheduling/cancelling is refused inside the shared revision
+    arbitration (409 ``scheduled_approval_due``) and changes nothing, so the
+    due adjudication is never skipped -- even while the sweeper is delayed
+    or disabled.
 
     A background sweeper (and a startup catch-up pass) processes due rows
     inside the shared singleton revision arbitration.  At the actual
